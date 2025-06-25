@@ -93,7 +93,7 @@ func (l *FileLogger) Flush() {
 	}
 }
 
-// 获取刷新协程是否已退出
+// 获取刷新协程是否已退出 (用于安全地读取一个并发标志位 ，判断后台刷新日志的协程（goroutine）是否已经退出。)
 func (l *FileLogger) getFlushWorkerExit() bool {
 	l.flushWorkerExitMu.Lock()
 	res := l.flushWorkerExit
@@ -105,7 +105,7 @@ func (l *FileLogger) getFlushWorkerExit() bool {
 func (l *FileLogger) flushWorker() {
 	for {
 		select {
-		case buf := <-l.bufChan:
+		case buf := <-l.bufChan: // 日志内容缓冲区
 			b := bytes.NewBufferString(buf)
 			for { // 这个内层 for 循环尝试从 bufChan 继续读取更多日志 减少 I/O 操作
 				select {
@@ -114,13 +114,13 @@ func (l *FileLogger) flushWorker() {
 					if b.Len() >= 2*1024*1024 { // 最大到2m 就实际写到文件中
 						goto OUT // 在 Go 语言中，goto 是一种跳转语句 ，用于将程序的控制流直接转移到同一函数内的某个标签(label)处。(因为要跳出两层嵌套结构（外层是 select，内层是 for），使用 goto 可以避免引入额外状态变量或复杂控制逻辑)
 					}
-				default:
+				default: // channel 被读完了
 					goto OUT
 				}
 			}
 		OUT:
 			_ = l.realWrite(b.String()) // 实际写到文件中
-		case <-l.flushChan:
+		case <-l.flushChan: // 清空缓冲区（bufChan），将其中剩余的所有日志内容立即写入磁盘文件中。
 			con := true
 			for con {
 				select {
@@ -132,7 +132,7 @@ func (l *FileLogger) flushWorker() {
 				}
 			}
 			l.flushWorkerExitMu.Lock()
-			l.flushWorkerExit = true
+			l.flushWorkerExit = true //标记刷新协程已退出
 			l.flushWorkerExitMu.Unlock()
 			return
 		}

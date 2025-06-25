@@ -467,11 +467,45 @@ func SetLogCtx(c string, i ...int64) {
 	}
 }
 
+// 初始化重要日志器
+func initLogImportant() error {
+	if loggerImportant != nil {
+		return nil
+	}
+	l := NewFileLogger()
+	err := l.Init("/home/important/ilog", "") // 重要日志一定会写到文件中
+	if err != nil {
+		return err
+	}
+	loggerImportant = l
+	return nil
+}
+
+// 输出重要日志
+func logItFmtImportant(template string, args ...interface{}) {
+	if loggerImportant == nil {
+		err := initLogImportant()
+		if err != nil {
+			return
+		}
+		if loggerImportant == nil {
+			panic("Unreachable")
+		}
+	}
+	msg := template
+	if msg == "" && len(args) > 0 {
+		msg = fmt.Sprint(args...)
+	} else if msg != "" && len(args) > 0 {
+		msg = fmt.Sprintf(template, args...)
+	}
+	logItImportant(msg)
+}
+
 /*=========================下面是日志方法==============================*/
 
 func Important(template string, args ...interface{}) {
 	logItFmt(nil, ImportantLevel, template, args...)
-	// logItFmtImportant(template, args...)
+	logItFmtImportant(template, args...)
 }
 func Infof(template string, args ...interface{}) {
 	logItFmt(nil, InfoLevel, template, args...)
