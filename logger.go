@@ -3,13 +3,18 @@ package logger
 import (
 	"bytes"
 	"fmt"
+	"github.com/lwm-galactic/logger/atexit"
 	"github.com/petermattis/goid" // 获取协程的id
+	"os"
 	"path"
 	"runtime"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 )
 
-type Level uint8
+type Level int8
 
 func (l Level) Color() string { // 获取日志颜色
 	switch l {
@@ -23,6 +28,7 @@ func (l Level) Color() string { // 获取日志颜色
 		return red
 	}
 }
+
 func (l Level) ShortString() string { // 日志的描述简短
 	switch l {
 	case DebugLevel:
@@ -46,19 +52,35 @@ func (l Level) ShortString() string { // 日志的描述简短
 	}
 }
 
+var colorEnd string // 日志结束颜色
 var red string
 var green string
 var yellow string
 var purple string
 var blue string
 var pid = 0                 // 进程id 初始化为0
-var modName = "UNKNOWN"     // go.mod 的名称 初始化为未知
 var formatTimeSec uint32    // 缓存上一次的时间戳（秒级）
 var formatTimeSecStr string // 缓存上一次格式化后的时间字符串
 var EnableLogCtx = true
+var logCtxMu sync.RWMutex       // 协程id 上下文 读写锁
+var logCtx = map[int64]string{} // 这个 map 的作用是：为每个协程（goroutine）保存一个“日志上下文”字符串，通常用于日志打印时输出额外的上下文信息。
+var (
+	minLevel        = DebugLevel // 最低打印的日志级别
+	fileSep         string
+	modName         = "UNKNOWN" // go.mod 的名称 初始化为未知
+	logger          ILogger
+	loggerImportant ILogger
+)
+
+func SetLogLevel(l Level) {
+	minLevel = l
+}
+func SetModName(name string) {
+	modName = name
+}
 
 const (
-	DebugLevel Level = iota
+	DebugLevel Level = iota - 1
 	InfoLevel
 	WarnLevel
 	ErrorLevel
@@ -76,14 +98,48 @@ const (
 	colorPurple
 )
 
+func init() {
+	// if runtime.GOOS != "windows" {
+	red = fmt.Sprintf("\x1b[%dm", colorRed)
+	green = fmt.Sprintf("\x1b[%dm", colorGreen)
+	yellow = fmt.Sprintf("\x1b[%dm", colorYellow)
+	blue = fmt.Sprintf("\u001B[%d;1m", colorBlue)
+	purple = fmt.Sprintf("\x1b[%dm", colorPurple)
+	colorEnd = "\x1b[0m"
+
+	atexit.Register(func() {
+		if logger != nil {
+			logger.Flush()
+		}
+		if loggerImportant != nil {
+			loggerImportant.Flush()
+		}
+	})
+}
+
 const defaultMaxFileSize int64 = 4 * 1024 * 1024 * 1024
 
-var minLevel = DebugLevel
+// OptLogFileType*：控制 日志中显示的源文件路径格式
+//
+//	OptLogFuncType*：控制 日志中显示的函数名格式
+const (
+	OptLogFileTypeDefault = 0 // default is full
+	OptLogFileTypeFull    = 1
+	OptLogFileTypeShort   = 2
+	OptLogFileTypeIgnore  = 3
+
+	OptLogFuncTypeDefault = 0
+	OptLogFuncTypeFull    = 1
+	OptLogFuncTypeIgnore  = 2
+)
+
+var defLogFile = OptLogFileTypeDefault
+var defLogFunc = OptLogFuncTypeDefault
 
 type Optimization struct {
-	ShortFile  string // 源码名字
-	FuncName   string // 方法名
-	CallerLine int    // 第几行
+	CallerFile string
+	CallerName string
+	CallerLine int
 
 	// 配置文件中读取
 	LogFileType int
@@ -92,7 +148,14 @@ type Optimization struct {
 	LogCtx      bool
 }
 
-var logger ILogger
+func NewOptimization() *Optimization {
+	return &Optimization{
+		LogFileType: OptLogFileTypeDefault,
+		LogFuncType: OptLogFuncTypeDefault,
+		LogFileLine: true,
+		LogCtx:      true,
+	}
+}
 
 type ILogger interface { // 日志接口定义
 	Write(buf string) error //将一段字符串日志内容 buf 写入到目标（如文件、控制台、网络等）。
@@ -110,6 +173,55 @@ func logItFmt(opt *Optimization, l Level, template string, args ...interface{}) 
 	}
 	logIt(opt, l, msg)
 	afterLog(l)
+}
+
+// args 参数 只打印参数
+func logItArgs(l Level, args ...interface{}) {
+	msg := fmt.Sprint(args...)
+	logIt(nil, l, msg)
+	afterLog(l)
+}
+
+// 携带*Optimization的打印
+func logItArgsWithOpt(opt *Optimization, l Level, args ...interface{}) {
+	msg := fmt.Sprint(args...)
+	logIt(opt, l, msg)
+	afterLog(l)
+}
+
+func logItImportant(msg string) {
+	msg = formatLog(nil, ImportantLevel, msg, 4)
+	loggerImportant.Write(msg)
+}
+
+// 根据日志的严重级别(Level)执行一些“善后处理”操作
+func afterLog(l Level) {
+	if l == FatalLevel || l == PanicLevel || l == DPanicLevel {
+		PrintStack(4) //  PrintStack(4) 的作用是打印调用栈（stack trace），参数 4 表示跳过前 4 层调用栈帧
+	}
+	if l == FatalLevel {
+		os.Exit(1) // 退出程序 无法修复
+	}
+	// panic 如果没有被 recover() 捕获，最终会导致程序崩溃;可以通过 defer + recover 来捕获和恢复。
+	if l == PanicLevel {
+		panic("")
+	}
+}
+
+// PrintStack 的作用是：从指定层数开始遍历当前 goroutine 的调用栈，并将每一层的函数名、文件路径和行号打印出来，常用于调试和日志系统中的错误追踪。
+func PrintStack(skip int) {
+	// 当前文件报错 递归获取调用者,直到最顶层
+	for ; ; skip++ {
+		pc, file, line, ok := runtime.Caller(skip)
+		if !ok {
+			break
+		}
+		name := runtime.FuncForPC(pc)
+		if name.Name() == "runtime.goexit" {
+			break
+		}
+		Errorf("#STACK: %s %s:%d", name.Name(), file, line)
+	}
 }
 
 // 实际日志打印
@@ -189,35 +301,128 @@ func formatLog(opt *Optimization, l Level, buf string, callerSkip int) string {
 		pc         uintptr // 程序计数器（Program Counter），可以用于获取函数名
 	)
 	//获取当前调用栈中的调用者信息（文件名、函数名、行号） ，用于日志、调试或性能分析等场景。
-	if opt == nil || opt.CallerLine == 0 {
-		pc, callerFile, callerLine, ok = runtime.Caller(callerSkip) //使用 runtime.Caller 获取调用栈信息
-		callerName = ""
-		if ok {
-			callerName = runtime.FuncForPC(pc).Name()
+	pc, callerFile, callerLine, ok = runtime.Caller(callerSkip)
+	callerName = ""
+	if ok {
+		callerName = runtime.FuncForPC(pc).Name()
+	}
+	// 混合opt 一起使用
+	if opt != nil {
+		if opt.CallerFile != "" {
+			callerFile = opt.CallerFile
 		}
+		if opt.CallerName != "" {
+			callerName = opt.CallerName
+		}
+		if opt.CallerLine != 0 {
+			callerLine = opt.CallerLine
+		}
+	}
+	// 缓存
+	if opt != nil && opt.CallerLine == 0 {
+		opt.CallerName = callerName
+		opt.CallerLine = callerLine
+		opt.CallerFile = callerFile
+	}
+	pkg, fn := splitPkgFunc(callerName)
 
-	} else {
-		callerFile = opt.ShortFile
-		callerName = opt.FuncName
-		callerLine = opt.CallerLine
+	// 拼接文件名
+	optFile := defLogFile // 默认日志文件名格式
+	if opt != nil {
+		optFile = opt.LogFileType // 传参的文件名格式
 	}
 
-	// 调用位置
-	filePath, fileFunc := getPackageName(callerName)
-	b.WriteString(path.Join(filePath, path.Base(callerFile)))
-	b.WriteString(":")
-	b.WriteString(fmt.Sprintf("%d:", callerLine))
-	b.WriteString(fileFunc)
+	switch optFile {
+	/* path.Base()
+	in: /home/user/file.txt  out:file.txt
+	in: /home/user/ out: user
+	in: C:\\Users\\test\\abc.go out: abc.go
+	*/
+	case OptLogFileTypeIgnore:
+	case OptLogFileTypeShort:
+		b.WriteString(path.Base(callerFile)) // callerFile 源文件路径（包含完整路径）
+		b.WriteByte(':')
+	default:
+		b.WriteString(path.Join(shortPkg(pkg), path.Base(callerFile)))
+		b.WriteByte(':')
+	}
+
+	// 拼接行 line
+	optLine := true
+	if opt != nil {
+		optLine = opt.LogFileLine
+	}
+	if optLine {
+		b.WriteString(strconv.Itoa(callerLine))
+		b.WriteByte(':')
+	}
+
+	// 拼接方法名 func
+	optFunc := defLogFunc
+	if opt != nil {
+		optFunc = opt.LogFuncType
+	}
+	switch optFunc {
+	case OptLogFuncTypeIgnore:
+	default:
+		if len(fn) <= 16 {
+			b.WriteString(fn)
+		} else {
+			b.Write([]byte(".."))
+			b.WriteString(fn[len(fn)-16:])
+		}
+	}
+
 	b.WriteString(colorEnd)
-	b.WriteString(" ")
+	b.WriteByte(' ')
 
 	// 文本内容
 	b.WriteString(buf)
-	b.WriteString("\n")
+	b.WriteByte('\n')
 
 	return b.String()
 }
 
+/*
+"github.com/pkg/project/service/user/impl"  "impl"
+"github.com/pkg/project/service/user/impl/v2" "impl/v2"
+"github.com/pkg/project/service/user" "user"(没有/impl，原样返回)
+"main" "main"
+""（空字符串） ""
+*/
+func shortPkg(pkg string) string {
+	const impl = "/impl"
+	pos := strings.LastIndex(pkg, impl)
+	if pos >= 0 {
+		n := pos + len(impl)
+		if (n < len(pkg) && pkg[n] == '/') || n >= len(pkg) {
+			return pkg[pos+1:]
+		}
+	}
+	return pkg
+}
+
+// 分割 包 和 函数名 提取后：pfx = "github.com/youruser/yourpkg/" , 剩下 fullName = "mypkg.MyFunc"
+func splitPkgFunc(fullName string) (pkg string, fn string) {
+	slashIndex := strings.LastIndexByte(fullName, '/') //  查找最后一个 /
+	var pfx string
+	if slashIndex >= 0 {
+		pfx = fullName[:slashIndex+1]
+		fullName = fullName[slashIndex+1:]
+	}
+
+	dot := strings.IndexByte(fullName, '.')
+	if dot >= 0 {
+		pkg = pfx + fullName[:dot]
+		fn = fullName[dot+1:]
+	} else {
+		pkg = pfx
+		fn = fullName
+	}
+	return
+}
+
+// GetLogCtx 协程安全的读操作
 func GetLogCtx(i ...int64) string {
 	if EnableLogCtx {
 		var cid int64
@@ -238,14 +443,109 @@ func GetLogCtx(i ...int64) string {
 	return ""
 }
 
+func SetLogCtx(c string, i ...int64) {
+	if EnableLogCtx {
+		if len(c) > 64 {
+			c = c[:62] + ".."
+		}
+		var cid int64
+		if len(i) == 0 {
+			cid = goid.Get()
+		} else if i[0] == 0 {
+			cid = goid.Get()
+		} else {
+			cid = i[0]
+		}
+
+		logCtxMu.Lock()
+		if c == "" {
+			delete(logCtx, cid)
+		} else {
+			logCtx[cid] = c
+		}
+		logCtxMu.Unlock()
+	}
+}
+
 /*=========================下面是日志方法==============================*/
 
+func Important(template string, args ...interface{}) {
+	logItFmt(nil, ImportantLevel, template, args...)
+	// logItFmtImportant(template, args...)
+}
+func Infof(template string, args ...interface{}) {
+	logItFmt(nil, InfoLevel, template, args...)
+}
+func InfofWithOpt(opt *Optimization, template string, args ...interface{}) {
+	logItFmt(opt, InfoLevel, template, args...)
+}
+func Printf(template string, args ...interface{}) {
+	logItFmt(nil, InfoLevel, template, args...)
+}
+func Fatal(args ...interface{}) {
+	logItArgs(FatalLevel, args...)
+}
+func Panic(args ...interface{}) {
+	logItArgs(PanicLevel, args...)
+}
+func DPanic(args ...interface{}) {
+	logItArgs(DPanicLevel, args...)
+}
+func Error(args ...interface{}) {
+	logItArgs(ErrorLevel, args...)
+}
+func ByCode(code int, args ...interface{}) {
+	prefix := fmt.Sprintf("errcode %d ", code)
+	args = append([]interface{}{prefix}, args...)
+	if code == 0 {
+		logItArgs(InfoLevel, args...)
+	} else if code > 0 {
+		logItArgs(WarnLevel, args...)
+	} else {
+		logItArgs(ErrorLevel, args...)
+	}
+}
+func Warn(args ...interface{}) {
+	logItArgs(WarnLevel, args...)
+}
 func Info(args ...interface{}) {
-
+	logItArgs(InfoLevel, args...)
 }
-func Infof(format string, args ...interface{}) {
-
+func InfoWithOpt(opt *Optimization, args ...interface{}) {
+	logItArgsWithOpt(opt, InfoLevel, args...)
 }
-func InfoWithOpt() {
-
+func Debug(args ...interface{}) {
+	// fast check
+	if DebugLevel < minLevel {
+		return
+	}
+	logItArgs(DebugLevel, args...)
+}
+func Debugf(template string, args ...interface{}) {
+	// fast check
+	if DebugLevel < minLevel {
+		return
+	}
+	logItFmt(nil, DebugLevel, template, args...)
+}
+func Warnf(template string, args ...interface{}) {
+	logItFmt(nil, WarnLevel, template, args...)
+}
+func WarnfWithOpt(opt *Optimization, template string, args ...interface{}) {
+	logItFmt(opt, WarnLevel, template, args...)
+}
+func Errorf(template string, args ...interface{}) {
+	logItFmt(nil, ErrorLevel, template, args...)
+}
+func ErrorfWithOpt(opt *Optimization, template string, args ...interface{}) {
+	logItFmt(opt, ErrorLevel, template, args...)
+}
+func DPanicf(template string, args ...interface{}) {
+	logItFmt(nil, DPanicLevel, template, args...)
+}
+func Panicf(template string, args ...interface{}) {
+	logItFmt(nil, PanicLevel, template, args...)
+}
+func Fatalf(template string, args ...interface{}) {
+	logItFmt(nil, FatalLevel, template, args...)
 }
